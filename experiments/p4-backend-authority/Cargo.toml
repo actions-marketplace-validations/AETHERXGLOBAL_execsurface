@@ -1,0 +1,27 @@
+[package]
+name = "execsurface-p4-backend-authority"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+execsurface-model = { path = "../../crates/execsurface-model" }
+execsurface-normalize = { path = "../../crates/execsurface-normalize" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[[bin]]
+name = "b1-open-fixture"
+path = "src/bin/b1_open_fixture.rs"
+
+[[bin]]
+name = "b2-rename-delete-fixture"
+path = "src/bin/b2_rename_delete_fixture.rs"
+
+[[bin]]
+name = "b3-connect-fixture"
+path = "src/bin/b3_connect_fixture.rs"
+
+[workspace]

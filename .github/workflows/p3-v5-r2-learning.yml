@@ -1,0 +1,21 @@
+name: P3 V5-R2 learning gate (frozen)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frozen-campaign-guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Reject additional V5-R2 learning samples
+        shell: bash
+        run: |
+          echo "P3 V5-R2 R2 is frozen."
+          echo "Only admissible learning run: 36569389464"
+          echo "Only admissible learning artifact: 11032959833"
+          echo "Artifact SHA-256: 0129b5c77dfbb3d91967918e9a281dcfb135eff100023be77bd14096e5acae41"
+          echo "No additional priming or learning samples are authorized."
+          exit 1

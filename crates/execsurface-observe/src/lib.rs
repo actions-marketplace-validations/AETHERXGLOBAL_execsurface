@@ -323,6 +323,33 @@ fn apply_shared_fd_ambiguity_guard(mut observation: Observation) -> Observation 
     observation
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtraceSharedFdGuardPolicy {
+    LegacyConservative,
+    #[cfg(test)]
+    CertificateAwareResearch,
+}
+
+fn finalize_ptrace_observation(
+    observation: Observation,
+    _clone_fd_semantics_certified: bool,
+    policy: PtraceSharedFdGuardPolicy,
+) -> Observation {
+    match policy {
+        PtraceSharedFdGuardPolicy::LegacyConservative => {
+            apply_shared_fd_ambiguity_guard(observation)
+        }
+        #[cfg(test)]
+        PtraceSharedFdGuardPolicy::CertificateAwareResearch => {
+            if _clone_fd_semantics_certified {
+                observation
+            } else {
+                apply_shared_fd_ambiguity_guard(observation)
+            }
+        }
+    }
+}
+
 fn classify_observation_completeness(observation: &Observation) -> CollectionCompleteness {
     if observation.complete {
         return CollectionCompleteness::Complete;
@@ -384,8 +411,16 @@ impl ObservationBackend for PtraceBackend {
     ) -> Result<BackendObservation, ObserveError> {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            let observation =
-                apply_shared_fd_ambiguity_guard(linux_ptrace::observe(spec, options)?);
+            let ptrace = linux_ptrace::observe(spec, options)?;
+            // Public/default behavior remains the accepted alpha.4/v2 contract.
+            // The certificate-aware mode is compiled only for research tests and
+            // cannot be selected by observe_command or the default backend.
+            let clone_fd_semantics_certified = ptrace.clone_fd_certification.fully_certified();
+            let observation = finalize_ptrace_observation(
+                ptrace.observation,
+                clone_fd_semantics_certified,
+                PtraceSharedFdGuardPolicy::LegacyConservative,
+            );
             let descriptor = self.descriptor();
             descriptor
                 .validate_capability_partition()
@@ -528,6 +563,83 @@ mod api_tests {
         assert_eq!(completeness, CollectionCompleteness::IncompleteLimit);
         assert!(!completeness.pass_eligible());
         assert!(CollectionCompleteness::Complete.pass_eligible());
+    }
+
+    fn c6r_clone_observation() -> Observation {
+        let mut observation = Observation::empty(execsurface_model::BackendMetadata {
+            name: "linux-ptrace-metadata-v2".to_owned(),
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            capabilities: Vec::new(),
+            limitations: Vec::new(),
+        });
+        observation.events.push(execsurface_model::RawEvent {
+            sequence: 1,
+            tid: 7,
+            kind: execsurface_model::RawEventKind::ProcessSpawn {
+                child_tid: 8,
+                mechanism: execsurface_model::SpawnMechanism::Clone,
+            },
+        });
+        observation
+    }
+
+    #[test]
+    fn c6r_default_policy_remains_legacy_even_with_positive_certificate() {
+        let finalized = finalize_ptrace_observation(
+            c6r_clone_observation(),
+            true,
+            PtraceSharedFdGuardPolicy::LegacyConservative,
+        );
+        assert!(!finalized.complete);
+        assert!(finalized
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "shared_fd_table_ambiguity"));
+    }
+
+    #[test]
+    fn c6r_uncertified_research_mode_remains_fail_closed() {
+        let finalized = finalize_ptrace_observation(
+            c6r_clone_observation(),
+            false,
+            PtraceSharedFdGuardPolicy::CertificateAwareResearch,
+        );
+        assert!(!finalized.complete);
+        assert!(finalized
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "shared_fd_table_ambiguity"));
+    }
+
+    #[test]
+    fn c6r_certified_research_mode_skips_only_synthetic_clone_guard() {
+        let finalized = finalize_ptrace_observation(
+            c6r_clone_observation(),
+            true,
+            PtraceSharedFdGuardPolicy::CertificateAwareResearch,
+        );
+        assert!(finalized.complete);
+        assert!(finalized.warnings.is_empty());
+    }
+
+    #[test]
+    fn c6r_certificate_never_clears_independent_incompleteness() {
+        let mut observation = c6r_clone_observation();
+        observation.complete = false;
+        observation.warnings.push(ObserverWarning {
+            code: "event_limit_exceeded".to_owned(),
+            tid: None,
+            message: "controlled independent blocker".to_owned(),
+        });
+        let finalized = finalize_ptrace_observation(
+            observation,
+            true,
+            PtraceSharedFdGuardPolicy::CertificateAwareResearch,
+        );
+        assert!(!finalized.complete);
+        assert_eq!(finalized.warnings.len(), 1);
+        assert_eq!(finalized.warnings[0].code, "event_limit_exceeded");
     }
 
     #[test]

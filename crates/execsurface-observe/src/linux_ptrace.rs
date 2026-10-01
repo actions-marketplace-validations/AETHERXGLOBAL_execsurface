@@ -235,11 +235,69 @@ impl FdTables {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct CloneFdCertification {
+    clone_events: u64,
+    correlated_clone_flags: u64,
+    shared_fd_transitions: u64,
+    cloned_fd_transitions: u64,
+    clone_thread_transitions: u64,
+    clone_origin_fork_events: u64,
+    clone_origin_vfork_events: u64,
+    ambiguity: bool,
+}
+
+impl CloneFdCertification {
+    fn record_clone(&mut self, flags: Option<u64>) {
+        self.clone_events += 1;
+        let Some(flags) = flags else {
+            self.ambiguity = true;
+            return;
+        };
+
+        self.correlated_clone_flags += 1;
+        if flags & libc::CLONE_FILES as u64 != 0 {
+            self.shared_fd_transitions += 1;
+        } else {
+            self.cloned_fd_transitions += 1;
+        }
+        if flags & libc::CLONE_THREAD as u64 != 0 {
+            self.clone_thread_transitions += 1;
+        }
+    }
+
+    fn record_clone_creation_event(&mut self, flags: Option<u64>, event: libc::c_int) {
+        self.record_clone(flags);
+        if event == libc::PTRACE_EVENT_FORK {
+            self.clone_origin_fork_events += 1;
+        } else if event == libc::PTRACE_EVENT_VFORK {
+            self.clone_origin_vfork_events += 1;
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.ambiguity = true;
+    }
+
+    pub(super) fn fully_certified(&self) -> bool {
+        !self.ambiguity
+            && self.clone_events == self.correlated_clone_flags
+            && self.clone_events == self.shared_fd_transitions + self.cloned_fd_transitions
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PtraceObservation {
+    pub(super) observation: Observation,
+    pub(super) clone_fd_certification: CloneFdCertification,
+}
+
 struct Collector {
     observation: Observation,
     sequence: u64,
     event_limit: usize,
     event_limit_reported: bool,
+    clone_fd_certification: CloneFdCertification,
 }
 
 impl Collector {
@@ -281,6 +339,7 @@ impl Collector {
             sequence: 0,
             event_limit,
             event_limit_reported: false,
+            clone_fd_certification: CloneFdCertification::default(),
         }
     }
 
@@ -309,6 +368,12 @@ impl Collector {
 
     fn warning(&mut self, tid: libc::pid_t, code: &str, message: impl Into<String>) {
         self.observation.complete = false;
+        if matches!(
+            code,
+            "clone_flags_unavailable" | "clone3_flags_unreadable" | "syscall_pairing_lost"
+        ) {
+            self.clone_fd_certification.invalidate();
+        }
         self.observation.warnings.push(ObserverWarning {
             code: code.to_owned(),
             tid: Some(tid),
@@ -320,7 +385,7 @@ impl Collector {
 pub(super) fn observe(
     spec: &CommandSpec,
     options: ObserveOptions,
-) -> Result<Observation, ObserveError> {
+) -> Result<PtraceObservation, ObserveError> {
     let (program, argv) = spec.c_argv()?;
     let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|arg| arg.as_ptr()).collect();
     argv_ptrs.push(ptr::null());
@@ -354,7 +419,10 @@ pub(super) fn observe(
     trace_parent(child, options)
 }
 
-fn trace_parent(root: libc::pid_t, options: ObserveOptions) -> Result<Observation, ObserveError> {
+fn trace_parent(
+    root: libc::pid_t,
+    options: ObserveOptions,
+) -> Result<PtraceObservation, ObserveError> {
     let mut status = 0;
     if unsafe { libc::waitpid(root, &mut status, 0) } < 0 {
         return Err(io::Error::last_os_error().into());
@@ -577,7 +645,10 @@ fn trace_parent(root: libc::pid_t, options: ObserveOptions) -> Result<Observatio
     }
 
     collector.observation.outcome = root_outcome;
-    Ok(collector.observation)
+    Ok(PtraceObservation {
+        observation: collector.observation,
+        clone_fd_certification: collector.clone_fd_certification,
+    })
 }
 
 fn apply_terminal_outcome(
@@ -648,6 +719,22 @@ fn handle_ptrace_event(
     match event {
         libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
             let child_tid = get_event_message(tid)? as libc::pid_t;
+            // C2/C3: the originating syscall is stronger evidence than the ptrace
+            // event label. Linux may report a clone-origin child as FORK/VFORK
+            // depending on clone flags / exit signal. Preserve the pending clone
+            // flags whenever they exist, regardless of event label.
+            let pending_clone_flags = tracees
+                .get(&tid)
+                .and_then(|state| state.pending_syscall.as_ref())
+                .and_then(|pending| match pending {
+                    PendingSyscall::Clone { flags } => Some(*flags),
+                    _ => None,
+                });
+            let clone_origin = pending_clone_flags.is_some();
+
+            // Preserve public raw-v2 ProcessSpawn semantics: mechanism remains
+            // event-label based. Syscall-origin truth is retained separately in the
+            // internal completeness certificate and must not silently reinterpret v2.
             let mechanism = match event {
                 libc::PTRACE_EVENT_FORK => SpawnMechanism::Fork,
                 libc::PTRACE_EVENT_VFORK => SpawnMechanism::Vfork,
@@ -659,24 +746,24 @@ fn handle_ptrace_event(
                 .map(|state| state.fd_table_id)
                 .unwrap_or(fd_tables.root_id());
             let parent_tgid = tracees.get(&tid).map(|state| state.tgid).unwrap_or(tid);
-            let clone_flags = if event == libc::PTRACE_EVENT_CLONE {
-                match tracees
-                    .get(&tid)
-                    .and_then(|state| state.pending_syscall.as_ref())
-                {
-                    Some(PendingSyscall::Clone { flags }) => Some(*flags),
-                    _ => {
-                        collector.warning(
-                            tid,
-                            "clone_flags_unavailable",
-                            "PTRACE_EVENT_CLONE observed without clone/clone3 flags; fd sharing and thread-group semantics are incomplete",
-                        );
-                        None
-                    }
-                }
+            let clone_flags = if clone_origin {
+                pending_clone_flags
+            } else if event == libc::PTRACE_EVENT_CLONE {
+                collector.warning(
+                    tid,
+                    "clone_flags_unavailable",
+                    "PTRACE child-creation event requires clone/clone3 origin flags, but no causally paired clone syscall was retained; fd sharing and thread-group semantics are incomplete",
+                );
+                None
             } else {
                 None
             };
+
+            if clone_origin || event == libc::PTRACE_EVENT_CLONE {
+                collector
+                    .clone_fd_certification
+                    .record_clone_creation_event(clone_flags, event);
+            }
 
             let share_files = clone_flags
                 .map(|flags| flags & libc::CLONE_FILES as u64 != 0)
@@ -1687,6 +1774,413 @@ mod tests {
             join_lexical("/tmp/work", "../secret"),
             "/tmp/work/../secret"
         );
+    }
+
+    #[test]
+    fn c1_a_clone_free_certificate_is_trivially_exact() {
+        let certificate = CloneFdCertification::default();
+        assert!(certificate.fully_certified());
+        assert_eq!(certificate.clone_events, 0);
+        assert_eq!(certificate.shared_fd_transitions, 0);
+        assert_eq!(certificate.cloned_fd_transitions, 0);
+    }
+
+    #[test]
+    fn c1_b_private_clone_is_classified_exactly_once() {
+        let mut certificate = CloneFdCertification::default();
+        certificate.record_clone(Some(0));
+        assert!(certificate.fully_certified());
+        assert_eq!(certificate.clone_events, 1);
+        assert_eq!(certificate.correlated_clone_flags, 1);
+        assert_eq!(certificate.shared_fd_transitions, 0);
+        assert_eq!(certificate.cloned_fd_transitions, 1);
+        assert_eq!(certificate.clone_thread_transitions, 0);
+    }
+
+    #[test]
+    fn c1_cde_shared_and_thread_bits_remain_independent() {
+        let mut shared = CloneFdCertification::default();
+        shared.record_clone(Some(libc::CLONE_FILES as u64));
+        assert!(shared.fully_certified());
+        assert_eq!(shared.shared_fd_transitions, 1);
+        assert_eq!(shared.clone_thread_transitions, 0);
+
+        let mut thread_only = CloneFdCertification::default();
+        thread_only.record_clone(Some(libc::CLONE_THREAD as u64));
+        assert!(thread_only.fully_certified());
+        assert_eq!(thread_only.shared_fd_transitions, 0);
+        assert_eq!(thread_only.cloned_fd_transitions, 1);
+        assert_eq!(thread_only.clone_thread_transitions, 1);
+
+        let mut both = CloneFdCertification::default();
+        both.record_clone(Some((libc::CLONE_THREAD | libc::CLONE_FILES) as u64));
+        assert!(both.fully_certified());
+        assert_eq!(both.shared_fd_transitions, 1);
+        assert_eq!(both.clone_thread_transitions, 1);
+    }
+
+    #[test]
+    fn c1_f_missing_clone_flags_fail_certification() {
+        let mut certificate = CloneFdCertification::default();
+        certificate.record_clone(None);
+        assert!(!certificate.fully_certified());
+        assert_eq!(certificate.clone_events, 1);
+        assert_eq!(certificate.correlated_clone_flags, 0);
+    }
+
+    #[test]
+    fn c1_g_clone3_unreadable_warning_invalidates_certification() {
+        let mut collector = Collector::new(128);
+        collector.warning(42, "clone3_flags_unreadable", "controlled test");
+        assert!(!collector.clone_fd_certification.fully_certified());
+        assert!(!collector.observation.complete);
+    }
+
+    #[test]
+    fn c1_i_exec_cloexec_unshares_from_other_shared_table_users() {
+        let mut tables = FdTables::new();
+        let shared_id = tables.root_id();
+        tables.insert_fd(
+            shared_id,
+            7,
+            FdEntry {
+                path: "/tmp/c1-cloexec".to_owned(),
+                cloexec: true,
+            },
+        );
+
+        let mut tracees = HashMap::new();
+        tracees.insert(100, TraceeState::root(shared_id, 100));
+        tracees.insert(101, TraceeState::child(shared_id, 100));
+        apply_exec_fd_semantics(101, &mut tracees, &mut tables);
+
+        let exec_table = tracees.get(&101).expect("execing task").fd_table_id;
+        assert_ne!(exec_table, shared_id);
+        assert!(tables.fd(exec_table, 7).is_none());
+        assert!(tables.fd(shared_id, 7).is_some());
+    }
+
+    #[test]
+    fn c1_jk_shared_mutation_and_fd_reuse_never_leave_stale_identity() {
+        let mut tables = FdTables::new();
+        let shared_id = tables.root_id();
+        tables.insert_fd(
+            shared_id,
+            9,
+            FdEntry {
+                path: "/tmp/c1-old".to_owned(),
+                cloexec: false,
+            },
+        );
+        tables.duplicate(shared_id, 9, 10, false);
+        assert_eq!(
+            tables.fd(shared_id, 10).expect("dup fd").path,
+            "/tmp/c1-old"
+        );
+
+        tables.remove_fd(shared_id, 9);
+        tables.insert_fd(
+            shared_id,
+            9,
+            FdEntry {
+                path: "/tmp/c1-new".to_owned(),
+                cloexec: false,
+            },
+        );
+        assert_eq!(
+            tables.fd(shared_id, 9).expect("reused fd").path,
+            "/tmp/c1-new"
+        );
+        assert_eq!(
+            tables.fd(shared_id, 10).expect("old dup remains").path,
+            "/tmp/c1-old"
+        );
+
+        tables.close_range(shared_id, 9, 10);
+        assert!(tables.fd(shared_id, 9).is_none());
+        assert!(tables.fd(shared_id, 10).is_none());
+    }
+
+    #[test]
+    #[ignore = "C1 real ptrace concurrency harness; run in the dedicated Linux gate"]
+    fn c1_real_ptrace_clone_modes_are_certified() {
+        use std::process::Command;
+
+        let root =
+            std::env::temp_dir().join(format!("execsurface-c1-real-clone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create C1 harness directory");
+        let source = root.join("clone_modes.c");
+        let binary = root.join("clone_modes");
+        std::fs::write(
+            &source,
+            r#"#define _GNU_SOURCE
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int child_main(void *unused) {
+    (void)unused;
+    _exit(0);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    int flags = 0;
+    if (strcmp(argv[1], "shared") == 0) {
+        flags |= CLONE_FILES;
+    } else if (strcmp(argv[1], "private") != 0) {
+        return 3;
+    }
+
+    const size_t stack_size = 1u << 20;
+    char *stack = malloc(stack_size);
+    if (!stack) return 4;
+    pid_t child = clone(child_main, stack + stack_size, flags, NULL);
+    if (child < 0) {
+        perror("clone");
+        free(stack);
+        return 5;
+    }
+
+    int status = 0;
+    if (waitpid(child, &status, __WCLONE) < 0) {
+        perror("waitpid");
+        free(stack);
+        return 6;
+    }
+    free(stack);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 7;
+}
+"#,
+        )
+        .expect("write C1 clone harness");
+
+        let compile = Command::new("cc")
+            .arg("-O2")
+            .arg("-Wall")
+            .arg("-Wextra")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .expect("invoke cc for C1 harness");
+        assert!(compile.success(), "C1 clone harness must compile");
+
+        let private = observe(
+            &CommandSpec::new(binary.as_os_str()).arg("private"),
+            ObserveOptions::default(),
+        )
+        .expect("observe private clone harness");
+        assert_eq!(private.observation.outcome.exit_code, Some(0));
+        assert!(private.clone_fd_certification.fully_certified());
+        assert!(private.clone_fd_certification.clone_events >= 1);
+        assert_eq!(private.clone_fd_certification.shared_fd_transitions, 0);
+        assert!(private.clone_fd_certification.cloned_fd_transitions >= 1);
+        assert_eq!(
+            private
+                .observation
+                .warnings
+                .iter()
+                .filter(|warning| warning.code == "clone_flags_unavailable")
+                .count(),
+            0
+        );
+
+        let shared = observe(
+            &CommandSpec::new(binary.as_os_str()).arg("shared"),
+            ObserveOptions::default(),
+        )
+        .expect("observe CLONE_FILES harness");
+        assert_eq!(shared.observation.outcome.exit_code, Some(0));
+        assert!(shared.clone_fd_certification.fully_certified());
+        assert!(shared.clone_fd_certification.clone_events >= 1);
+        assert!(shared.clone_fd_certification.shared_fd_transitions >= 1);
+        assert_eq!(shared.clone_fd_certification.cloned_fd_transitions, 0);
+        assert_eq!(
+            shared
+                .observation
+                .warnings
+                .iter()
+                .filter(|warning| warning.code == "clone_flags_unavailable")
+                .count(),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore = "C3 live clone-origin event-routing harness; run in the dedicated Linux gate"]
+    fn c3_clone_sigchld_fork_event_keeps_clone_fd_authority() {
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!(
+            "execsurface-c3-clone-sigchld-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create C3 SIGCHLD harness directory");
+        let source = root.join("clone_sigchld.c");
+        let binary = root.join("clone_sigchld");
+        std::fs::write(
+            &source,
+            r#"#define _GNU_SOURCE
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int child_main(void *unused) {
+    (void)unused;
+    _exit(0);
+}
+
+int main(void) {
+    const size_t stack_size = 1u << 20;
+    char *stack = malloc(stack_size);
+    if (!stack) return 2;
+    int flags = CLONE_FILES | SIGCHLD;
+    pid_t child = clone(child_main, stack + stack_size, flags, NULL);
+    if (child < 0) {
+        perror("clone");
+        free(stack);
+        return 3;
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0) {
+        perror("waitpid");
+        free(stack);
+        return 4;
+    }
+    free(stack);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 5;
+}
+"#,
+        )
+        .expect("write C3 SIGCHLD clone harness");
+
+        let compile = Command::new("cc")
+            .arg("-O2")
+            .arg("-Wall")
+            .arg("-Wextra")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .expect("compile C3 SIGCHLD clone harness");
+        assert!(compile.success());
+
+        let observed = observe(
+            &CommandSpec::new(binary.as_os_str()),
+            ObserveOptions::default(),
+        )
+        .expect("observe C3 SIGCHLD clone harness");
+        assert_eq!(observed.observation.outcome.exit_code, Some(0));
+        assert!(observed.clone_fd_certification.fully_certified());
+        assert!(observed.clone_fd_certification.shared_fd_transitions >= 1);
+        assert!(
+            observed.clone_fd_certification.clone_origin_fork_events >= 1,
+            "Linux should route clone(..., CLONE_FILES|SIGCHLD) through PTRACE_EVENT_FORK under the declared options"
+        );
+        assert!(observed.observation.events.iter().any(|event| matches!(
+            &event.kind,
+            RawEventKind::ProcessSpawn {
+                mechanism: SpawnMechanism::Fork,
+                ..
+            }
+        )));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore = "C3 live clone-origin VFORK routing harness; run in the dedicated Linux gate"]
+    fn c3_clone_vfork_event_keeps_clone_fd_authority() {
+        use std::process::Command;
+
+        let root =
+            std::env::temp_dir().join(format!("execsurface-c3-clone-vfork-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create C3 VFORK harness directory");
+        let source = root.join("clone_vfork.c");
+        let binary = root.join("clone_vfork");
+        std::fs::write(
+            &source,
+            r#"#define _GNU_SOURCE
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int child_main(void *unused) {
+    (void)unused;
+    _exit(0);
+}
+
+int main(void) {
+    const size_t stack_size = 1u << 20;
+    char *stack = malloc(stack_size);
+    if (!stack) return 2;
+    int flags = CLONE_FILES | CLONE_VM | CLONE_VFORK | SIGCHLD;
+    pid_t child = clone(child_main, stack + stack_size, flags, NULL);
+    if (child < 0) {
+        perror("clone");
+        free(stack);
+        return 3;
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0) {
+        perror("waitpid");
+        free(stack);
+        return 4;
+    }
+    free(stack);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 5;
+}
+"#,
+        )
+        .expect("write C3 VFORK clone harness");
+
+        let compile = Command::new("cc")
+            .arg("-O2")
+            .arg("-Wall")
+            .arg("-Wextra")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .expect("compile C3 VFORK clone harness");
+        assert!(compile.success());
+
+        let observed = observe(
+            &CommandSpec::new(binary.as_os_str()),
+            ObserveOptions::default(),
+        )
+        .expect("observe C3 VFORK clone harness");
+        assert_eq!(observed.observation.outcome.exit_code, Some(0));
+        assert!(observed.clone_fd_certification.fully_certified());
+        assert!(observed.clone_fd_certification.shared_fd_transitions >= 1);
+        assert!(
+            observed.clone_fd_certification.clone_origin_vfork_events >= 1,
+            "Linux should route CLONE_VFORK clone origin through PTRACE_EVENT_VFORK under the declared options"
+        );
+        assert!(observed.observation.events.iter().any(|event| matches!(
+            &event.kind,
+            RawEventKind::ProcessSpawn {
+                mechanism: SpawnMechanism::Vfork,
+                ..
+            }
+        )));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
